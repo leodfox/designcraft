@@ -56,18 +56,20 @@ pub fn start() {
                         log::info!("designcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
                     }
                     let inbox: Inbox = Inbox::default();
+                    let bridge: BridgeQueue = BridgeQueue::default();
+                    install_bridge(bridge.clone(), cc.egui_ctx.clone());
                     let mut app = DesignApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));
                     if has_query_flag(&query(), "sample") {
                         let _ = app.run("file.newSample", serde_json::json!({}));
                     }
-                    Ok(Box::new(WebShell { app, inbox }))
+                    Ok(Box::new(WebShell { app, inbox, bridge }))
                 }),
             )
             .await;
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
             match result {
                 Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>DesignCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+                Err(e) => el.set_inner_html(&format!("<p>Ardoise Mise en page failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
             }
         }
     });
@@ -82,6 +84,7 @@ fn query() -> String {
 struct WebShell {
     app: DesignApp,
     inbox: Inbox,
+    bridge: BridgeQueue,
 }
 
 impl eframe::App for WebShell {
@@ -101,6 +104,12 @@ impl eframe::App for WebShell {
                     Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
                 }
             });
+        }
+        // Files pushed by the host (postMessage bridge) are imported like dropped files.
+        let pushed = std::mem::take(&mut *self.bridge.lock().unwrap_or_else(|e| e.into_inner()));
+        for (name, bytes) in pushed {
+            let request = self.app.import_request("drop");
+            self.inbox.lock().unwrap_or_else(|e| e.into_inner()).push(ImportedFile { request, name, bytes });
         }
         self.app.logic(ctx);
     }
@@ -126,7 +135,7 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
             } else if request.purpose == "place" {
                 rfd::AsyncFileDialog::new().add_filter("Graphics", IMAGE_EXTS)
             } else {
-                rfd::AsyncFileDialog::new().add_filter("DesignCraft", DOC_EXTS)
+                rfd::AsyncFileDialog::new().add_filter("Ardoise Mise en page", DOC_EXTS)
             };
             wasm_bindgen_futures::spawn_local(async move {
                 let Some(file) = dialog.pick_file().await else {
@@ -154,6 +163,9 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
 fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
     let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "designcraft".into());
+    if post_saved(&name, bytes) {
+        return Ok(());
+    }
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
     let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
@@ -175,4 +187,147 @@ fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
     });
     window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(js)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ardoise host bridge (postMessage). Protocol: see BRIDGE.md in the Ardoise repository.
+//   -> parent  {type:"ready", app}                           once the editor is up
+//   <- editor  {type:"open", name, bytes:ArrayBuffer}         only from window.parent at ?parentOrigin=
+//   -> parent  {type:"saved", app, name, bytes:ArrayBuffer}   native-format save inside an iframe
+// ---------------------------------------------------------------------------------------------
+const ARDOISE_APP: &str = "layout";
+const NATIVE_EXTS: &[&str] = &["designcraft"];
+
+/// Files pushed by the host, drained by the shell on every frame (the shell knows the active document).
+pub type BridgeQueue = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+fn js_err(e: wasm_bindgen::JsValue) -> String {
+    format!("{e:?}")
+}
+
+/// True when this page is embedded in another window (an iframe).
+fn in_iframe() -> bool {
+    let Some(w) = web_sys::window() else {
+        return false;
+    };
+    match w.parent() {
+        Ok(Some(p)) => !js_sys::Object::is(&p, &w),
+        _ => false,
+    }
+}
+
+fn str_field(obj: &wasm_bindgen::JsValue, key: &str) -> Option<String> {
+    js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key)).ok()?.as_string()
+}
+
+/// Accept only `https://host[:port]` or `http://localhost[:port]` (no path, query, fragment or userinfo).
+fn valid_origin(o: &str) -> bool {
+    let (rest, https) = match (o.strip_prefix("https://"), o.strip_prefix("http://")) {
+        (Some(r), _) => (r, true),
+        (None, Some(r)) => (r, false),
+        _ => return false,
+    };
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')) {
+        return false;
+    }
+    let (host, port) = match rest.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    if host.is_empty() || host.starts_with(['.', '-']) || host.ends_with(['.', '-']) || host.contains(':') {
+        return false;
+    }
+    if let Some(p) = port
+        && (p.is_empty() || p.len() > 5 || !p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    https || host == "localhost"
+}
+
+/// The embedding page's origin, from `?parentOrigin=...`. `None` disables the bridge.
+fn parent_origin() -> Option<String> {
+    let q = query();
+    let raw = q.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("parentOrigin="))?;
+    let decoded: String = js_sys::decode_uri_component(raw).ok()?.into();
+    valid_origin(&decoded).then_some(decoded)
+}
+
+/// Post `msg` to the parent window, addressed to the validated parent origin only (never "*").
+fn post_to_parent(msg: &js_sys::Object) -> Result<(), String> {
+    let origin = parent_origin().ok_or("bridge disabled (no valid parentOrigin)")?;
+    let w = web_sys::window().ok_or("no window")?;
+    let parent = w.parent().map_err(js_err)?.ok_or("no parent window")?;
+    parent.post_message(msg, &origin).map_err(js_err)
+}
+
+fn message(fields: &[(&str, wasm_bindgen::JsValue)]) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    for (k, v) in fields {
+        let _ = js_sys::Reflect::set(&o, &wasm_bindgen::JsValue::from_str(k), v);
+    }
+    o
+}
+
+/// Listen for `open` messages from same-origin senders and announce `ready` to the parent.
+fn install_bridge(queue: BridgeQueue, ctx: egui::Context) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(parent_origin) = parent_origin() else {
+        log::info!("bridge disabled: no valid parentOrigin in the query string");
+        return;
+    };
+    let on_message = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
+        if ev.origin() != parent_origin {
+            return;
+        }
+        let from_parent = match (ev.source(), web_sys::window().and_then(|w| w.parent().ok().flatten())) {
+            (Some(src), Some(par)) => js_sys::Object::is(&src, &par),
+            _ => false,
+        };
+        if !from_parent {
+            return;
+        }
+        let data = ev.data();
+        if str_field(&data, "type").as_deref() != Some("open") {
+            return;
+        }
+        let Ok(bytes) = js_sys::Reflect::get(&data, &wasm_bindgen::JsValue::from_str("bytes")) else {
+            return;
+        };
+        if !(bytes.is_instance_of::<js_sys::ArrayBuffer>() || bytes.is_instance_of::<js_sys::Uint8Array>()) {
+            log::warn!("bridge: open message without ArrayBuffer bytes ignored");
+            return;
+        }
+        let name = str_field(&data, "name").filter(|n| !n.is_empty()).unwrap_or_else(|| "file".into());
+        let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
+        queue.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+        ctx.request_repaint();
+    });
+    let _ = window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref());
+    on_message.forget();
+    if in_iframe()
+        && let Err(e) = post_to_parent(&message(&[("type", "ready".into()), ("app", ARDOISE_APP.into())]))
+    {
+        log::error!("bridge: ready message failed: {e}");
+    }
+}
+
+/// Native-format save inside an iframe: hand the bytes to the host instead of downloading.
+/// Returns true when the bytes were posted.
+fn post_saved(name: &str, bytes: &[u8]) -> bool {
+    let ext = name.rsplit('.').next().map(str::to_ascii_lowercase).unwrap_or_default();
+    if !in_iframe() || parent_origin().is_none() || !NATIVE_EXTS.contains(&ext.as_str()) {
+        return false;
+    }
+    let buffer = js_sys::Uint8Array::from(bytes).buffer();
+    let msg = message(&[("type", "saved".into()), ("app", ARDOISE_APP.into()), ("name", name.into()), ("bytes", buffer.into())]);
+    match post_to_parent(&msg) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("bridge: saved message failed ({e}); falling back to download");
+            false
+        }
+    }
 }
